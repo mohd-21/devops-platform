@@ -1,0 +1,30 @@
+groups:
+  - name: deployment-tracker
+    rules:
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[5m]))
+            / sum(rate(http_requests_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "More than 5% of requests are failing"
+
+      - alert: HighLatencyP95
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(http_request_duration_seconds_bucket[5m]))) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 latency above 500ms"
+
+      - alert: TargetDown
+        expr: up{job="deployment-tracker"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Deployment tracker is not being scraped"

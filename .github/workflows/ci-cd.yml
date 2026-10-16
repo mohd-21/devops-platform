@@ -1,0 +1,124 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  test:
+    name: Lint & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: python -m pytest -q
+
+  validate-infra:
+    name: Validate Terraform & Kubernetes manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: Terraform fmt & validate
+        working-directory: terraform
+        run: |
+          terraform fmt -check -recursive
+          terraform init -backend=false
+          terraform validate
+      - name: Kubernetes manifest schema check
+        run: |
+          curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar xz
+          ./kubeconform -strict -summary k8s/
+
+  build-and-push:
+    name: Build & push image
+    needs: [test, validate-infra]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        run: |
+          VERSION="${GITHUB_REF_NAME}-${GITHUB_SHA::7}"
+          echo "version=${VERSION//\//-}" >> "$GITHUB_OUTPUT"
+          echo "image=${REGISTRY}/${IMAGE_NAME,,}:${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.image }}
+          build-args: APP_VERSION=${{ steps.meta.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  scan:
+    name: Image vulnerability scan
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ needs.build-and-push.outputs.image }}
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+        env:
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+
+  deploy:
+    name: Deploy to Kubernetes
+    needs: [build-and-push, scan]
+    if: github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Request a ServiceNow change (optional)
+        if: vars.SERVICENOW_ENABLED == 'true'
+        env:
+          SN_INSTANCE: ${{ secrets.SN_INSTANCE }}
+          SN_USER: ${{ secrets.SN_USER }}
+          SN_PASSWORD: ${{ secrets.SN_PASSWORD }}
+          VERSION: ${{ needs.build-and-push.outputs.version }}
+        run: |
+          curl -fsS -u "$SN_USER:$SN_PASSWORD" \
+            -H "Content-Type: application/json" \
+            -X POST "https://${SN_INSTANCE}.service-now.com/api/now/table/change_request" \
+            -d "{\"short_description\":\"Deploy ${VERSION}\",\"type\":\"standard\"}"
+      - name: Configure kubeconfig
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+        run: |
+          mkdir -p ~/.kube
+          echo "$KUBE_CONFIG" | base64 -d > ~/.kube/config
+      - name: Roll out new image
+        env:
+          IMAGE: ${{ needs.build-and-push.outputs.image }}
+        run: |
+          kubectl apply -f k8s/
+          kubectl set image deployment/deployment-tracker app="$IMAGE"
+          kubectl rollout status deployment/deployment-tracker --timeout=120s
