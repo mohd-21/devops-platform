@@ -6,15 +6,29 @@ A small Flask API that records deployments, wrapped in the full delivery toolcha
 
 ## Architecture
 
-```
- git push ──► GitHub Actions ──► test ─► validate IaC ─► build image ─► Trivy scan ─► deploy
-                                                              │                         │
-                                                              ▼                         ▼
-                                                        GHCR registry            Kubernetes (2+ pods, HPA)
-                                                                                        │ /metrics
-                                                                            Prometheus ◄┘──► Grafana
-                                                                            (alert rules)
- Terraform ──► AWS: VPC, public/private subnets, ECR repo (scan on push, lifecycle policy)
+```mermaid
+flowchart TB
+    dev(["Developer"]) -->|"git push"| test
+
+    subgraph gha["GitHub Actions"]
+        test["Lint and test"] --> val["Validate Terraform and K8s"]
+        val --> build["Build image"]
+        build --> scan["Trivy scan"]
+        scan --> deploy["Deploy"]
+    end
+
+    build -->|"push image"| ghcr[("GHCR registry")]
+
+    subgraph k8s["Kubernetes cluster"]
+        pods["App pods, 2 to 6 with HPA"]
+    end
+
+    deploy -->|"rollout"| pods
+    pods -->|"/metrics"| prom["Prometheus"]
+    prom --> graf["Grafana dashboards"]
+    prom -->|"alert rules"| alerts["Alerts"]
+
+    tf["Terraform"] -->|"provisions"| aws["AWS: VPC, subnets, ECR"]
 ```
 
 ## What's inside
