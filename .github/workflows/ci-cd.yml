@@ -79,15 +79,15 @@ jobs:
     needs: build-and-push
     runs-on: ubuntu-latest
     steps:
-      - uses: aquasecurity/trivy-action@0.24.0
-        with:
-          image-ref: ${{ needs.build-and-push.outputs.image }}
-          severity: CRITICAL,HIGH
-          exit-code: "1"
-          ignore-unfixed: true
+      - name: Scan image with Trivy (fails on fixable CRITICAL/HIGH)
         env:
+          IMAGE: ${{ needs.build-and-push.outputs.image }}
           TRIVY_USERNAME: ${{ github.actor }}
           TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          docker run --rm -e TRIVY_USERNAME -e TRIVY_PASSWORD \
+            aquasec/trivy:latest image \
+            --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 "$IMAGE"
 
   deploy:
     name: Deploy to Kubernetes
